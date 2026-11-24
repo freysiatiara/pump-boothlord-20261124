@@ -146,7 +146,7 @@ function priceLteByBps(
 // ---------------------------------------------------------------- per-mint tape
 //
 // Kept only for curves rich enough to be sleeve candidates (or already held):
-// every trade in the last TAPE_KEEP_SLOTS slots plus a reserve snapshot per trade,
+// every trade in the last TAPE_KEEP_SEC seconds plus a reserve snapshot per trade,
 // which is everything the grind filter and the flow-fade exit read.
 
 interface TapeTrade {
