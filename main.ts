@@ -8,9 +8,11 @@
 //     (price at most +25% above the create price), and only when the opening tape looks
 //     genuine: at least 2 distinct non-creator buyers, net buy flow positive, and the
 //     creator has not sold anything. A launch the creator is already dumping is skipped.
-//   - EXIT FAST: take profit +35%, stop loss -10%, trailing stop -12% from the peak once
-//     up +15%, or a time stop after 1500 slots (~10 minutes). Losers are cut before they
-//     bleed for hours; the creator selling while we hold exits at once.
+//   - EXIT: stop loss -15%, trailing stop -25% from the peak once up +50%, or a time
+//     stop after 20,000 slots (~2.2 hours). There is deliberately NO fixed take profit:
+//     capping winners at +20-35% threw away the fat tail that pays for the losers (v1's
+//     best win, +0.163 SOL, was a position that rode to completion). Losers are cut
+//     before they bleed for hours; the creator selling while we hold exits at once.
 // Stakes stay small (0.05 SOL) and at most 5 positions are open, so the bot cycles
 // through many fresh launches; every buy is >= 0.01 SOL, clearing the 20-distinct-mint
 // round-trip guardrail.
@@ -48,15 +50,17 @@ const MIN_NET_BUY_LAMPORTS = 100_000_000n;
 const MIN_TRADES = 3;
 /** Entry: curve must hold at least this much real SOL. */
 const MIN_REAL_SOL_LAMPORTS = 300_000_000n;
-/** Take profit: position value >= cost * 1.35. */
-const TAKE_PROFIT_BPS = 13_500;
-/** Stop loss: position value <= cost * 0.90. */
-const STOP_LOSS_BPS = 9000;
-/** Trailing stop arms once value >= cost * 1.15, then sells at value <= peak * 0.88. */
-const TRAIL_ARM_BPS = 11_500;
-const TRAIL_BPS = 8800;
+/** Take profit: effectively off (+1000%) — runners are left to run to completion and
+    are harvested by the trailing stop instead; capping winners at +20-35% threw away
+    the fat tail that pays for the losers (v1's best win, +0.163 SOL, rode to completion). */
+const TAKE_PROFIT_BPS = 1_000_000;
+/** Stop loss: position value <= cost * 0.85. */
+const STOP_LOSS_BPS = 8500;
+/** Trailing stop arms once value >= cost * 1.50, then sells at value <= peak * 0.75. */
+const TRAIL_ARM_BPS = 15_000;
+const TRAIL_BPS = 7500;
 /** Time stop: sell after this many slots held. */
-const MAX_HOLD_SLOTS = 1500;
+const MAX_HOLD_SLOTS = 20_000;
 /** Rest after an exit before the same mint may be bought again. */
 const COOLDOWN_SLOTS = 2000;
 /** Most buys per mint over the run. */
