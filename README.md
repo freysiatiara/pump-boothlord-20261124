@@ -10,16 +10,14 @@ A momentum breakout bot for the pump.fun paper-trading replay (`agent-fun/replay
 
 ## Strategy
 
-Watch every new bonding curve from first sight. Buy a small fixed stake (0.10 SOL) when the price breaks out: **+8% above the first-seen price and +15% above the low since first seen**, with at least 4 recorded trades, and never more than +60% above first seen (no chasing tops).
+Early-snipe bot: enter young launches fast, exit fast.
 
-Exits, measured on position value vs cost (fees included):
+- **Entry** (within ~100 slots of a curve's creation): price at most +25% above the create price, at least 2 distinct non-creator buyers, net buy flow positive, and the creator has not sold. A launch the creator is already dumping is skipped.
+- **Exits**, measured on position value vs cost (fees included): take profit at **+20%**, stop loss at **−10%**, trailing stop **−8% from the peak** once up **+10%**, time stop after **600 slots** (~4 minutes), exit at once if the creator sells while we hold.
 
-- Take profit at **+30%**
-- Stop loss at **−15%**
-- Trailing stop **−12% from the peak** once up **+10%**
-- Time stop after **12,000 slots** held
+Stakes stay small (0.05 SOL) and at most 5 positions are open, so the bot keeps rotating through fresh launches — every buy is ≥ 0.01 SOL, clearing the 20-distinct-mint round-trip guardrail with a wide margin.
 
-Stakes stay small and at most 5 positions are open, so the bot keeps rotating through fresh breakouts — every buy is ≥ 0.01 SOL, clearing the 20-distinct-mint round-trip guardrail.
+Dev grade (kit's 24h dev window, `grade-local --driver process`): **net PnL −0.328 SOL, win rate 19.6%, max drawdown 0.034, 296 round trips over 296 distinct mints, 592 fills** — guardrail cleared easily, determinism reproduced (two executions, byte-identical action logs).
 
 ## Determinism
 

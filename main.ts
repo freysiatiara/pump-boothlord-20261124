@@ -1,22 +1,19 @@
-// Pump.fun Paper Sprint — early-snipe bot, v5 (fresh strategy, written for this entry).
+// Pump.fun Paper Sprint — early-snipe bot, v2 (fresh strategy, written for this entry).
 //
-// v5 combines what the dev grades taught across v1-v4 on the 24h dev window:
-//   v1 (-2.25 SOL): buying a +8% breakout and holding for hours mostly buys the top.
-//   v2 (-0.33 SOL): entering early with fast exits fixed most of the bleed.
-//   v3 (-0.30 SOL): stricter entry cut trips without clearly improving per-trip EV.
-//   v4 (-0.28 SOL): no fixed take-profit let one win reach +0.048 SOL, but win rate fell.
-// v5 keeps v2's loose early entry (more shots at the fat tail: >=2 distinct buyers,
-// net buy flow > 0, runup <= +25%) and v3's roomier exits (take profit +35%, trailing
-// stop -12% from the peak once up +15%, time stop 1500 slots) so winners get more room
-// than v2's +20% cap without v4's near-total reliance on a handful of runners.
-//
-// Entry (all must hold, decided within ~100 slots of a curve's creation):
-//   at least 2 distinct non-creator buyers, net buy flow positive, creator has not sold,
-//   price at most +25% above the create price, curve holds >= 0.3 SOL real.
-// Exits: take profit +35%, stop loss -10%, trailing stop -12% from peak once up +15%,
-// time stop after 1500 slots (~10 minutes), exit at once if the creator sells.
-// Stakes are small (0.05 SOL), at most 5 positions open, every buy >= 0.01 SOL so the
-// 20-distinct-mint round-trip guardrail clears with a wide margin.
+// v1 lesson (dev grade -2.25 SOL, win rate 21.8%): buying a +8% breakout and holding up
+// to 12,000 slots mostly buys the top of a move that then reverts, while the +30% take
+// profit caps the few real runners (the biggest v1 win, +0.163 SOL, was a position that
+// rode to completion past the cap). v2 flips both sides:
+//   - ENTER EARLY: within ~100 slots of a curve's creation, before the move has run far
+//     (price at most +25% above the create price), and only when the opening tape looks
+//     genuine: at least 2 distinct non-creator buyers, net buy flow positive, and the
+//     creator has not sold anything. A launch the creator is already dumping is skipped.
+//   - EXIT FAST: take profit +20%, stop loss -10%, trailing stop -8% from the peak once
+//     up +10%, or a time stop after 600 slots (~4 minutes). Losers are cut before they
+//     bleed for hours; the creator selling while we hold exits at once.
+// Stakes stay small (0.05 SOL) and at most 5 positions are open, so the bot cycles
+// through many fresh launches; every buy is >= 0.01 SOL, clearing the 20-distinct-mint
+// round-trip guardrail.
 //
 // Fully deterministic: every decision comes from the batch stream only (insertion-ordered
 // maps, exact bigint price comparisons, no clock, no environment, no Math.random).
@@ -49,15 +46,15 @@ const MIN_BUYERS = 2;
 const MIN_TRADES = 3;
 /** Entry: curve must hold at least this much real SOL. */
 const MIN_REAL_SOL_LAMPORTS = 300_000_000n;
-/** Take profit: position value >= cost * 1.35. */
-const TAKE_PROFIT_BPS = 13_500;
+/** Take profit: position value >= cost * 1.20. */
+const TAKE_PROFIT_BPS = 12_000;
 /** Stop loss: position value <= cost * 0.90. */
 const STOP_LOSS_BPS = 9000;
-/** Trailing stop arms once value >= cost * 1.15, then sells at value <= peak * 0.88. */
-const TRAIL_ARM_BPS = 11_500;
-const TRAIL_BPS = 8800;
+/** Trailing stop arms once value >= cost * 1.10, then sells at value <= peak * 0.92. */
+const TRAIL_ARM_BPS = 11_000;
+const TRAIL_BPS = 9200;
 /** Time stop: sell after this many slots held. */
-const MAX_HOLD_SLOTS = 1500;
+const MAX_HOLD_SLOTS = 600;
 /** Rest after an exit before the same mint may be bought again. */
 const COOLDOWN_SLOTS = 2000;
 /** Most buys per mint over the run. */
