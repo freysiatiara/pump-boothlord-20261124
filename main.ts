@@ -15,11 +15,15 @@
 //
 //   SLEEVE — one small deliberate risk: a fixed ~0.30 SOL stake, no adds ever, at
 //   most 2 open and 5 entries per run, 1 per mint, only on mature curves (age
-//   >= 600 slots, 25-85 SOL of real reserves) whose last 120 slots grind up slowly
-//   and broadly: net inflow >= 1.5 SOL and positive in both halves, price +3..20%
-//   with the second-half rise <= 12%, >= 10 buy trades from >= 6 distinct buyers,
-//   and no single trade over 40% of the inflow. Hard exits: +14% take profit,
-//   -8% stop, flow fade (-1 SOL net over the last 30 slots), 1,200-slot time cap.
+//   >= 600 slots, 25-85 SOL of real reserves) whose last 600 s of block time
+//   grind up slowly and broadly: net inflow >= 1.5 SOL and positive in both
+//   halves, price +3..20% with the second-half rise <= 12%, >= 10 buy trades
+//   from >= 6 distinct buyers, and no single trade over 40% of the inflow.
+//   Hard exits: +14% take profit, -8% stop, flow fade (-1 SOL net over the
+//   last 120 s), 900 s time cap. (The grind is measured in block time, not
+//   slots: this stream runs ~4.7 slots per second, so a slot-counted lookback
+//   would span seconds and read spikes as grinds — round 1 graded -0.111 SOL
+//   that way; the time-based filter is the fix.)
 //
 //   CLOCK — entries stop at 4.5 h of block time (probes at ~5.3 h) and everything
 //   is flattened at 5.5 h, ahead of the 6-hour window's end.
@@ -74,9 +78,13 @@ const SLEEVE_MIN_REAL_LAMPORTS = 25n * LAMPORTS_PER_SOL;
 const SLEEVE_MAX_REAL_LAMPORTS = 85n * LAMPORTS_PER_SOL;
 /** Tape starts being kept once a curve holds this much real SOL (below the band). */
 const TAPE_MIN_REAL_LAMPORTS = 20n * LAMPORTS_PER_SOL;
-/** Grind lookback: the last 120 slots, split into two 60-slot halves. */
-const GRIND_SLOTS = 120;
-const GRIND_HALF_SLOTS = 60;
+/**
+ * Grind lookback, in block-time seconds: the last 600 s, split into two 300 s
+ * halves. (This dataset runs ~4.7 slots per second of block time, so a lookback
+ * counted in slots would span seconds, not a slow grind.)
+ */
+const GRIND_SEC = 600;
+const GRIND_HALF_SEC = 300;
 /** Net inflow over the lookback must reach 1.5 SOL, positive in each half. */
 const GRIND_MIN_NET_LAMPORTS = LAMPORTS_PER_SOL * 3n / 2n;
 /** At least 10 buy trades from at least 6 distinct buyers in the lookback. */
@@ -86,16 +94,19 @@ const GRIND_MIN_BUYERS = 6;
 const GRIND_MIN_RISE_BPS = 300;
 const GRIND_MAX_RISE_BPS = 2000;
 const GRIND_MAX_HALF_RISE_BPS = 1200;
-/** Tape is retained this far back (slots); the grind window must be covered. */
-const TAPE_KEEP_SLOTS = 260;
+/** Tape is retained this far back (seconds of block time); the window must be covered. */
+const TAPE_KEEP_SEC = 1500;
+/** A sleeve curve must also have been taped for at least this long (seconds). */
+const SLEEVE_MIN_TAPE_SEC = 590;
 /** Exits: take profit at value >= cost * 1.14; stop at value <= cost * 0.92. */
 const EXIT_TP_BPS = 11_400;
 const EXIT_SL_BPS = 9200;
-/** Flow fade: net flow over the last 30 slots at or below -1 SOL exits. */
-const FADE_SLOTS = 30;
+/** Flow fade: net flow over the last 120 s of block time at or below -1 SOL exits. */
+const FADE_SEC = 120;
 const FADE_NET_LAMPORTS = -LAMPORTS_PER_SOL;
-/** Time cap on a sleeve position, in slots held. */
-const SLEEVE_MAX_HOLD_SLOTS = 1200;
+/** Time cap on a sleeve position: 900 s of block time (6,000 slots as backstop). */
+const SLEEVE_MAX_HOLD_SEC = 900;
+const SLEEVE_MAX_HOLD_SLOTS = 6000;
 
 /** Slippage allowances (bps). Probes take any fill; sleeve orders keep some guard. */
 const PROBE_BUY_SLIPPAGE_BPS = 10_000;
@@ -140,6 +151,8 @@ function priceLteByBps(
 
 interface TapeTrade {
   slot: number;
+  /** Block time (seconds) of the batch that carried the trade. */
+  time: number;
   isBuy: boolean;
   sol: bigint;
   user: Pubkey;
@@ -147,6 +160,7 @@ interface TapeTrade {
 
 interface TapeSnap {
   slot: number;
+  time: number;
   vq: bigint;
   vt: bigint;
 }
@@ -167,21 +181,21 @@ function tapeFor(mint: Pubkey): Tape {
   return t;
 }
 
-function pruneTape(t: Tape, nowSlot: number): void {
-  const floor = nowSlot - TAPE_KEEP_SLOTS;
+function pruneTape(t: Tape, nowSec: number): void {
+  const floor = nowSec - TAPE_KEEP_SEC;
   let n = 0;
-  while (n < t.trades.length && t.trades[n].slot < floor) n += 1;
+  while (n < t.trades.length && t.trades[n].time < floor) n += 1;
   if (n > 0) t.trades.splice(0, n);
   let m = 0;
-  while (m < t.snaps.length && t.snaps[m].slot < floor) m += 1;
+  while (m < t.snaps.length && t.snaps[m].time < floor) m += 1;
   if (m > 0) t.snaps.splice(0, m);
 }
 
-/** Latest snapshot at or before `slot`; the earliest one when all are newer. */
-function snapAtOrBefore(t: Tape, slot: number): TapeSnap | null {
+/** Latest snapshot at or before `time`; the earliest one when all are newer. */
+function snapAtOrBefore(t: Tape, time: number): TapeSnap | null {
   let best: TapeSnap | null = null;
   for (const s of t.snaps) {
-    if (s.slot <= slot) best = s;
+    if (s.time <= time) best = s;
     else break;
   }
   return best ?? (t.snaps.length > 0 ? t.snaps[0] : null);
@@ -212,7 +226,7 @@ const probeDone = new Set<Pubkey>();
 const buyMintByClient = new Map<string, Pubkey>();
 
 // Sleeve.
-const sleeveHeld = new Map<Pubkey, { entrySlot: number }>();
+const sleeveHeld = new Map<Pubkey, { entrySlot: number; entryTime: number }>();
 const sleeveBuyPending = new Set<Pubkey>();
 const sleeveEntered = new Set<Pubkey>();
 let sleeveEntries = 0;
@@ -262,7 +276,7 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
   // Positions we hold but never classified (a sleeve buy that filled): adopt them.
   for (const mint of state.positions.keys()) {
     if (sleeveEntered.has(mint) && !sleeveHeld.has(mint) && !probeHeld.has(mint)) {
-      sleeveHeld.set(mint, { entrySlot: slot });
+      sleeveHeld.set(mint, { entrySlot: slot, entryTime: nowTime });
     }
   }
 
@@ -273,18 +287,21 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
     const rich = curve !== undefined && curve.real_quote_reserves >= TAPE_MIN_REAL_LAMPORTS;
     if (!rich && !tapes.has(e.mint) && !sleeveHeld.has(e.mint)) continue;
     const t = tapeFor(e.mint);
+    const when = e.block_time ?? nowTime;
     t.trades.push({
       slot: e.slot,
+      time: when,
       isBuy: e.is_buy,
       sol: BigInt(e.sol_amount),
       user: e.user,
     });
     t.snaps.push({
       slot: e.slot,
+      time: when,
       vq: BigInt(e.virtual_quote_reserves),
       vt: BigInt(e.virtual_token_reserves),
     });
-    pruneTape(t, slot);
+    pruneTape(t, when);
   }
 
   let free = state.freeCashLamports();
@@ -324,6 +341,7 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
     let exit = false;
     if (value * 10_000n >= cost * BigInt(EXIT_TP_BPS)) exit = true;
     if (value * 10_000n <= cost * BigInt(EXIT_SL_BPS)) exit = true;
+    if (nowTime - heldPos.entryTime >= SLEEVE_MAX_HOLD_SEC) exit = true;
     if (slot - heldPos.entrySlot >= SLEEVE_MAX_HOLD_SLOTS) exit = true;
     if (elapsed >= FLATTEN_SEC) exit = true;
     if (!exit) {
@@ -331,7 +349,7 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
       if (t !== undefined) {
         let net = 0n;
         for (const tr of t.trades) {
-          if (tr.slot > slot - FADE_SLOTS) net += tr.isBuy ? tr.sol : -tr.sol;
+          if (tr.time > nowTime - FADE_SEC) net += tr.isBuy ? tr.sol : -tr.sol;
         }
         if (net <= FADE_NET_LAMPORTS) exit = true;
       }
@@ -373,10 +391,10 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
       if (slot - firstSeen < SLEEVE_MIN_AGE_SLOTS) continue;
       if (curve.real_quote_reserves < SLEEVE_MIN_REAL_LAMPORTS) continue;
       if (curve.real_quote_reserves > SLEEVE_MAX_REAL_LAMPORTS) continue;
-      // The grind window must be covered by the tape.
-      if (tape.snaps.length === 0 || tape.snaps[0].slot > slot - GRIND_SLOTS + 10) continue;
-      const startSnap = snapAtOrBefore(tape, slot - GRIND_SLOTS);
-      const halfSnap = snapAtOrBefore(tape, slot - GRIND_HALF_SLOTS);
+      // The grind window must be covered by the tape, in block time.
+      if (tape.snaps.length === 0 || tape.snaps[0].time > nowTime - SLEEVE_MIN_TAPE_SEC) continue;
+      const startSnap = snapAtOrBefore(tape, nowTime - GRIND_SEC);
+      const halfSnap = snapAtOrBefore(tape, nowTime - GRIND_HALF_SEC);
       if (startSnap === null || halfSnap === null) continue;
       let net = 0n;
       let netFirst = 0n;
@@ -386,10 +404,10 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
       let buyTrades = 0;
       const buyers = new Set<Pubkey>();
       for (const tr of tape.trades) {
-        if (tr.slot <= slot - GRIND_SLOTS) continue;
+        if (tr.time <= nowTime - GRIND_SEC) continue;
         const signed = tr.isBuy ? tr.sol : -tr.sol;
         net += signed;
-        if (tr.slot <= slot - GRIND_HALF_SLOTS) netFirst += signed;
+        if (tr.time <= nowTime - GRIND_HALF_SEC) netFirst += signed;
         else netSecond += signed;
         if (tr.isBuy) {
           grossBuy += tr.sol;
