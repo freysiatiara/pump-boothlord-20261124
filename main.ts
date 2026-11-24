@@ -1,25 +1,23 @@
-// Pump.fun Paper Sprint — momentum breakout bot (fresh strategy, written for this entry).
+// Pump.fun Paper Sprint — early-snipe bot, v2 (fresh strategy, written for this entry).
 //
-// Idea: on a 6-hour replay of fresh pump.fun curves, most coins die flat and a few run.
-// This bot watches every curve from the moment it first appears, records its first-seen
-// price and its low since then, and buys a small fixed stake when the price breaks out:
-//   +8% above the first-seen price AND +15% above the low since first seen,
-//   while not already up more than +60% from first seen (do not chase the top).
-// It needs at least 4 recorded trades so the breakout is real tape, not one print.
-//
-// Exits (all measured on position value vs cost, fees included in cost):
-//   take profit at +30%, stop loss at -15%, trailing stop -12% from the peak once the
-//   position has been up +10%, or a time stop after MAX_HOLD_SLOTS slots held.
-// A sold coin rests for COOLDOWN_SLOTS and may be bought at most twice per run.
-//
-// Rotation is the point: stakes are small (0.10 SOL) and at most 5 positions are open,
-// so the bot keeps cycling through fresh breakouts. The guardrail needs round trips of
-// at least 0.01 SOL on 20 distinct mints; every buy here is >= 0.01 SOL by construction
-// (the size cap must clear MIN_BUY_LAMPORTS first), and the time stop forces turnover.
+// v1 lesson (dev grade -2.25 SOL, win rate 21.8%): buying a +8% breakout and holding up
+// to 12,000 slots mostly buys the top of a move that then reverts, while the +30% take
+// profit caps the few real runners (the biggest v1 win, +0.163 SOL, was a position that
+// rode to completion past the cap). v2 flips both sides:
+//   - ENTER EARLY: within ~100 slots of a curve's creation, before the move has run far
+//     (price at most +25% above the create price), and only when the opening tape looks
+//     genuine: at least 2 distinct non-creator buyers, net buy flow positive, and the
+//     creator has not sold anything. A launch the creator is already dumping is skipped.
+//   - EXIT FAST: take profit +20%, stop loss -10%, trailing stop -8% from the peak once
+//     up +10%, or a time stop after 600 slots (~4 minutes). Losers are cut before they
+//     bleed for hours; the creator selling while we hold exits at once.
+// Stakes stay small (0.05 SOL) and at most 5 positions are open, so the bot cycles
+// through many fresh launches; every buy is >= 0.01 SOL, clearing the 20-distinct-mint
+// round-trip guardrail.
 //
 // Fully deterministic: every decision comes from the batch stream only (insertion-ordered
-// maps, bigint price comparisons by cross-multiplication, no clock, no environment,
-// no Math.random). Diagnostics go to stderr; stdout carries replies only.
+// maps, exact bigint price comparisons, no clock, no environment, no Math.random).
+// Diagnostics go to stderr; stdout carries replies only.
 
 import {
   LAMPORTS_PER_SOL,
@@ -34,27 +32,29 @@ import {
 
 // ---------------------------------------------------------------- parameters
 
-/** SOL per buy (0.10 SOL). */
-const STAKE_LAMPORTS = LAMPORTS_PER_SOL / 10n;
+/** SOL per buy (0.05 SOL). */
+const STAKE_LAMPORTS = LAMPORTS_PER_SOL / 20n;
 /** Smallest buy worth sending; also the guardrail's minimum round-trip buy. */
 const MIN_BUY_LAMPORTS = LAMPORTS_PER_SOL / 100n;
-/** Breakout: price >= first-seen price * (1 + 8%). */
-const ENTRY_UP_FIRST_BPS = 800;
-/** Breakout: price >= low-since-seen * (1 + 15%). */
-const ENTRY_UP_LOW_BPS = 1500;
-/** Do not chase: price must stay <= first-seen price * (1 + 60%). */
-const ENTRY_MAX_UP_BPS = 6000;
-/** Recorded trades on the curve before it can be bought. */
-const MIN_TRADES = 4;
-/** Take profit: position value >= cost * 1.30. */
-const TAKE_PROFIT_BPS = 13_000;
-/** Stop loss: position value <= cost * 0.85. */
-const STOP_LOSS_BPS = 8500;
-/** Trailing stop arms once value >= cost * 1.10, then sells at value <= peak * 0.88. */
+/** Oldest age (slots since creation) at which a first buy may still be decided. */
+const MAX_ENTRY_AGE_SLOTS = 100;
+/** Entry: price at most +25% above the create price. */
+const MAX_RUNUP_BPS = 2500;
+/** Entry: at least this many distinct non-creator buyers seen. */
+const MIN_BUYERS = 2;
+/** Entry: at least this many recorded trades. */
+const MIN_TRADES = 3;
+/** Entry: curve must hold at least this much real SOL. */
+const MIN_REAL_SOL_LAMPORTS = 300_000_000n;
+/** Take profit: position value >= cost * 1.20. */
+const TAKE_PROFIT_BPS = 12_000;
+/** Stop loss: position value <= cost * 0.90. */
+const STOP_LOSS_BPS = 9000;
+/** Trailing stop arms once value >= cost * 1.10, then sells at value <= peak * 0.92. */
 const TRAIL_ARM_BPS = 11_000;
-const TRAIL_BPS = 8800;
+const TRAIL_BPS = 9200;
 /** Time stop: sell after this many slots held. */
-const MAX_HOLD_SLOTS = 12_000;
+const MAX_HOLD_SLOTS = 600;
 /** Rest after an exit before the same mint may be bought again. */
 const COOLDOWN_SLOTS = 2000;
 /** Most buys per mint over the run. */
@@ -69,15 +69,6 @@ const SELL_SLIPPAGE_BPS = 5000;
 // Compare prices a/b vs c/d by cross-multiplication: a*d ? c*b. All comparisons below
 // are exact bigint arithmetic, so two runs of the same stream agree bit for bit.
 
-/** price(vqA, vtA) >= price(vqB, vtB) * (10000 + bps) / 10000 ? */
-function priceGteByBps(
-  vqA: bigint, vtA: bigint,
-  vqB: bigint, vtB: bigint,
-  bps: number,
-): boolean {
-  return vqA * vtB * 10_000n >= vqB * vtA * BigInt(10_000 + bps);
-}
-
 /** price(vqA, vtA) <= price(vqB, vtB) * (10000 + bps) / 10000 ? */
 function priceLteByBps(
   vqA: bigint, vtA: bigint,
@@ -85,11 +76,6 @@ function priceLteByBps(
   bps: number,
 ): boolean {
   return vqA * vtB * 10_000n <= vqB * vtA * BigInt(10_000 + bps);
-}
-
-/** price(vqA, vtA) < price(vqB, vtB) ? */
-function priceLt(vqA: bigint, vtA: bigint, vqB: bigint, vtB: bigint): boolean {
-  return vqA * vtB < vqB * vtA;
 }
 
 /** Current SOL value of `tokens` at reserves (vq, vt), rounded down. */
@@ -103,10 +89,15 @@ function valueLamports(tokens: bigint, vq: bigint, vt: bigint): bigint {
 interface MintTrack {
   firstVq: bigint;
   firstVt: bigint;
-  lowVq: bigint;
-  lowVt: bigint;
-  trades: number;
+  creator: Pubkey | null;
   createdSlot: number | null;
+  trades: number;
+  /** Distinct non-creator wallets that bought. */
+  buyers: Set<Pubkey>;
+  /** SOL bought minus SOL sold on the observed tape (lamports, signed). */
+  netBuyLamports: bigint;
+  /** The creator sold at least once. */
+  creatorSold: boolean;
   entries: number;
   cooldownUntil: number;
 }
@@ -129,13 +120,14 @@ let buysFilled = 0;
 let sellsFilled = 0;
 const roundTripped = new Set<Pubkey>();
 
-function trackFor(mint: Pubkey, vq: bigint, vt: bigint, slot: number): MintTrack {
+function trackFor(mint: Pubkey, vq: bigint, vt: bigint): MintTrack {
   let t = tracks.get(mint);
   if (t === undefined) {
     t = {
       firstVq: vq, firstVt: vt,
-      lowVq: vq, lowVt: vt,
-      trades: 0, createdSlot: null,
+      creator: null, createdSlot: null,
+      trades: 0, buyers: new Set<Pubkey>(),
+      netBuyLamports: 0n, creatorSold: false,
       entries: 0, cooldownUntil: 0,
     };
     tracks.set(mint, t);
@@ -179,17 +171,21 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
         e.mint,
         BigInt(e.virtual_quote_reserves),
         BigInt(e.virtual_token_reserves),
-        e.slot,
       );
       if (t.createdSlot === null) t.createdSlot = e.slot;
+      if (t.creator === null) t.creator = e.creator;
     } else if (e.event === 'TradeEvent') {
       const vq = BigInt(e.virtual_quote_reserves);
       const vt = BigInt(e.virtual_token_reserves);
-      const t = trackFor(e.mint, vq, vt, e.slot);
+      const t = trackFor(e.mint, vq, vt);
       t.trades += 1;
-      if (priceLt(vq, vt, t.lowVq, t.lowVt)) {
-        t.lowVq = vq;
-        t.lowVt = vt;
+      const sol = BigInt(e.sol_amount);
+      if (e.is_buy) {
+        t.netBuyLamports += sol;
+        if (t.creator === null || e.user !== t.creator) t.buyers.add(e.user);
+      } else {
+        t.netBuyLamports -= sol;
+        if (t.creator !== null && e.user === t.creator) t.creatorSold = true;
       }
     }
     // CompleteEvent: nothing to track; state.curves already marks it complete.
@@ -218,7 +214,9 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
       h.peakValue * 10_000n >= cost * BigInt(TRAIL_ARM_BPS) &&
       value * 10_000n <= h.peakValue * BigInt(TRAIL_BPS);
     const timeStop = slot - h.entrySlot >= MAX_HOLD_SLOTS;
-    if (takeProfit || stopLoss || trailing || timeStop) {
+    const track = tracks.get(mint);
+    const creatorDumped = track !== undefined && track.creatorSold;
+    if (takeProfit || stopLoss || trailing || timeStop || creatorDumped) {
       if (orders.length >= caps.max_orders_per_batch) continue;
       const sell: SellInput = {
         side: 'sell',
@@ -232,7 +230,7 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
     }
   }
 
-  // --- entries: breakouts seen in this batch's events -----------------------------
+  // --- entries: young launches with a genuine-looking opening tape ----------------
   let openSlots = caps.max_open_positions - state.committedPositionCount();
   for (const e of batch.events) {
     if (orders.length >= caps.max_orders_per_batch) break;
@@ -243,16 +241,20 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
     const t = tracks.get(mint);
     const curve = state.curves.get(mint);
     if (t === undefined || curve === undefined || curve.complete) continue;
+    if (t.createdSlot === null) continue;
+    if (slot - t.createdSlot > MAX_ENTRY_AGE_SLOTS) continue;
     if (t.trades < MIN_TRADES) continue;
+    if (t.buyers.size < MIN_BUYERS) continue;
+    if (t.creatorSold) continue;
+    if (t.netBuyLamports <= 0n) continue;
     if (t.entries >= MAX_ENTRIES_PER_MINT) continue;
     if (slot < t.cooldownUntil) continue;
+    if (curve.real_quote_reserves < MIN_REAL_SOL_LAMPORTS) continue;
     const vq = curve.virtual_quote_reserves;
     const vt = curve.virtual_token_reserves;
     if (vt === 0n) continue;
-    // Breakout: up 8% from first seen, up 15% from the low, not up more than 60%.
-    if (!priceGteByBps(vq, vt, t.firstVq, t.firstVt, ENTRY_UP_FIRST_BPS)) continue;
-    if (!priceGteByBps(vq, vt, t.lowVq, t.lowVt, ENTRY_UP_LOW_BPS)) continue;
-    if (!priceLteByBps(vq, vt, t.firstVq, t.firstVt, ENTRY_MAX_UP_BPS)) continue;
+    // Do not chase: price at most +25% above the create price.
+    if (!priceLteByBps(vq, vt, t.firstVq, t.firstVt, MAX_RUNUP_BPS)) continue;
     // Size: the per-reply cap (1% of real reserve) must clear the guardrail minimum.
     const cap = state.maxBuyLamports(mint);
     if (cap < MIN_BUY_LAMPORTS) continue;
