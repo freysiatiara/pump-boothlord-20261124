@@ -11,11 +11,7 @@
 //   PROBES — the guardrail bar (>= 20 coins with a >= 0.01 SOL round trip, max
 //   drawdown 50%) is met with tiny 0.011 SOL round trips on liquid curves, sold in
 //   the first batch after the buy fills. 24 coins are targeted (bar is 20) over the
-//   first ~75 minutes of block time. Expected drag ~0.0005 SOL per coin. Probe
-//   candidates are filtered for safety (round 2 measured raw probes bleeding on
-//   coins mid-dump): the triggering trade must be a buy, the curve at least
-//   300 slots old with >= 3 SOL of real reserves, and its price no more than 2%
-//   below the previous batch's close.
+//   first ~75 minutes of block time. Expected drag ~0.0005 SOL per coin.
 //
 //   SLEEVE — one small deliberate risk: a fixed ~0.30 SOL stake, no adds ever, at
 //   most 2 open and 5 entries per run, 1 per mint, only on mature curves (age
@@ -61,11 +57,7 @@ const PROBE_CATCHUP_SEC = 5400;
 /** No new probes after this much block time. */
 const PROBE_STOP_SEC = 19_000;
 /** A probe candidate needs at least this much real SOL reserve (1% cap >= probe). */
-const PROBE_MIN_REAL_LAMPORTS = 3n * LAMPORTS_PER_SOL;
-/** A probe candidate must be at least this old (slots): fresh launches rug too fast. */
-const PROBE_MIN_AGE_SLOTS = 300;
-/** Skip a probe when the price fell more than 2% since the previous batch. */
-const PROBE_MAX_DROP_BPS = -200;
+const PROBE_MIN_REAL_LAMPORTS = 2n * LAMPORTS_PER_SOL;
 /** Attempts per mint before a probe moves on (a failed tx pays its fee and retries). */
 const PROBE_MAX_ATTEMPTS = 2;
 /** Most probe buys in flight (pending or held) at once. */
@@ -232,10 +224,6 @@ const probeHeld = new Set<Pubkey>();
 const probeDone = new Set<Pubkey>();
 /** client_id -> mint for every buy we send, probe or sleeve. */
 const buyMintByClient = new Map<string, Pubkey>();
-/** Price after each mint's latest trade as of the END of the previous batch. */
-const lastPrice = new Map<Pubkey, { vq: bigint; vt: bigint }>();
-/** First slot each mint was seen trading (age proxy when created_slot is null). */
-const firstTradeSlot = new Map<Pubkey, number>();
 
 // Sleeve.
 const sleeveHeld = new Map<Pubkey, { entrySlot: number; entryTime: number }>();
@@ -473,7 +461,6 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
         if (probeDone.size + probeBuyPending.size + probeHeld.size >= desired) break;
         if (probeBuyPending.size + probeHeld.size >= PROBE_MAX_INFLIGHT) break;
         if (e.event !== 'TradeEvent') continue;
-        if (!e.is_buy) continue;
         const mint = e.mint;
         if (seen.has(mint)) continue;
         seen.add(mint);
@@ -485,17 +472,6 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
         if (curve === undefined || curve.complete) continue;
         if (curve.real_quote_reserves < PROBE_MIN_REAL_LAMPORTS) continue;
         if (state.maxBuyLamports(mint) < PROBE_LAMPORTS) continue;
-        // Age and dump filters: no fresh launches, no curves in freefall.
-        const born = curve.created_slot ?? firstTradeSlot.get(mint) ?? slot;
-        if (slot - born < PROBE_MIN_AGE_SLOTS) continue;
-        const prev = lastPrice.get(mint);
-        if (prev !== undefined && prev.vt !== 0n && curve.virtual_token_reserves !== 0n) {
-          if (!priceGteByBps(
-            curve.virtual_quote_reserves, curve.virtual_token_reserves,
-            prev.vq, prev.vt,
-            PROBE_MAX_DROP_BPS,
-          )) continue;
-        }
         if (free < PROBE_LAMPORTS + tx) break;
         const clientId = state.clientId();
         const buy: BuyInput = {
@@ -513,16 +489,6 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
         free -= PROBE_LAMPORTS + tx;
       }
     }
-  }
-
-  // --- fold this batch's trades into the price/age memory for the next batch -------
-  for (const e of batch.events) {
-    if (e.event !== 'TradeEvent') continue;
-    if (!firstTradeSlot.has(e.mint)) firstTradeSlot.set(e.mint, e.slot);
-    lastPrice.set(e.mint, {
-      vq: BigInt(e.virtual_quote_reserves),
-      vt: BigInt(e.virtual_token_reserves),
-    });
   }
 
   return orders;
